@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import random
@@ -6,6 +7,13 @@ import uuid
 import pathlib
 import asyncio
 from typing import Dict, Any, Optional, List
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger()
 
 app = FastAPI(title="WebSocket Game Backend")
 
@@ -274,7 +282,7 @@ async def evaluate_and_advance_question(room_code: str):
     # Wait 5.0 seconds so players can comfortably view the round result
     await asyncio.sleep(5.0)
 
-    if room_code not in rooms:
+    if room_code not in rooms or room["status"] != "question_result" or len(room["players"]) < 2:
         return
 
     # Advance to next question or end game
@@ -329,6 +337,7 @@ def read_root():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    logger.info("New WebSocket client connected")
 
     current_player_id: Optional[str] = None
     current_room_code: Optional[str] = None
@@ -339,6 +348,7 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 data = json.loads(raw_data)
             except json.JSONDecodeError:
+                logger.warning("Received invalid JSON format: %s", raw_data)
                 await websocket.send_text(json.dumps({"type": "ERROR", "message": "Invalid JSON format."}))
                 continue
 
@@ -397,6 +407,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 avatar = data.get("avatar", "🦊")
 
                 if room_code not in rooms:
+                    logger.warning(f"Failed to join room: Room {room_code} does not exist")
                     await websocket.send_text(json.dumps({
                         "type": "ERROR",
                         "message": f"房間 {room_code} 不存在"
@@ -405,6 +416,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 room = rooms[room_code]
                 if room["status"] != "waiting":
+                    logger.warning(f"Failed to join room: Game in room {room_code} is already in progress")
                     await websocket.send_text(json.dumps({
                         "type": "ERROR",
                         "message": "遊戲進行中，無法加入房間"
@@ -412,6 +424,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if len(room["players"]) >= 10:
+                    logger.warning(f"Failed to join room: Room {room_code} reached maximum capacity (10 players)")
                     await websocket.send_text(json.dumps({
                         "type": "ERROR",
                         "message": "房間人數已達 10 人上限"
@@ -431,6 +444,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 current_player_id = player_id
                 current_room_code = room_code
+
+                logger.info(f"Player {player_name} (ID: {player_id}) successfully joined room {room_code}")
 
                 await websocket.send_text(json.dumps({
                     "type": "ROOM_JOINED",
@@ -556,6 +571,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"type": "ERROR", "message": f"未知的事件類型: {event_type}"}))
 
     except WebSocketDisconnect:
+        if current_room_code or current_player_id:
+            logger.info(f"WebSocket client disconnected (Player ID: {current_player_id}, Room: {current_room_code})")
+        else:
+            logger.info("WebSocket client disconnected (Not in any room)")
+
         if current_room_code and current_room_code in rooms:
             room = rooms[current_room_code]
             if current_player_id in room["players"]:
@@ -566,11 +586,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if len(room["players"]) == 0:
                     del rooms[current_room_code]
+                    logger.info(f"All players left. Room {current_room_code} has been destroyed")
                 else:
                     if room["host_id"] == current_player_id:
                         new_host_id = next(iter(room["players"]))
                         room["host_id"] = new_host_id
                         room["players"][new_host_id]["is_host"] = True
+                        logger.info(f"Host disconnected. Host status for room {current_room_code} transferred to new host ID: {new_host_id}")
 
                     if room["target_user_id"] == current_player_id:
                         room["target_user_id"] = None
@@ -582,6 +604,25 @@ async def websocket_endpoint(websocket: WebSocket):
                         "room_state": get_room_state(current_room_code)
                     })
 
-                    # Check if all remaining players submitted answer
-                    if room["status"] == "playing" and len(room["answers"]) >= len(room["players"]) and len(room["players"]) > 0:
+                    # Check for game abort threshold: abort game if active and remaining players < 2
+                    if room["status"] in ["playing", "question_result"] and len(room["players"]) < 2:
+                        room["status"] = "waiting"
+                        room["question_index"] = 0
+                        room["questions"] = []
+                        room["question_history"] = []
+                        room["analysis_summary"] = None
+                        room["answers"] = {}
+                        room["target_user_id"] = None
+                        for p_id in room["players"]:
+                            room["scores"][p_id] = 0
+
+                        logger.info(f"Game aborted in room {current_room_code} due to insufficient players (< 2 players). State reset to waiting.")
+
+                        await broadcast_to_room(current_room_code, {
+                            "type": "GAME_ABORTED",
+                            "message": "其他玩家已離開，人數不足無法繼續遊戲",
+                            "room_state": get_room_state(current_room_code)
+                        })
+                    elif room["status"] == "playing" and len(room["answers"]) >= len(room["players"]) and len(room["players"]) > 0:
+                        # Check if all remaining players submitted answer
                         await evaluate_and_advance_question(current_room_code)

@@ -331,6 +331,10 @@ function RoomLobbyContent() {
           } else if (data.room_state?.analysis_summary) {
             setAnalysisSummary(data.room_state.analysis_summary);
           }
+        } else if (type === "GAME_ABORTED") {
+          setRoomState(data.room_state);
+          setLastQuestionResult(null);
+          setErrorMsg(data.message || "其他玩家已離開，人數不足無法繼續遊戲");
         } else if (type === "ERROR") {
           const msg = data.message || "發生錯誤";
           setErrorMsg(msg);
